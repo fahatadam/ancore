@@ -1,272 +1,203 @@
-# Ancore Wallet dApp API Reference
+# Ancore dApp API Reference & Message Protocol
 
-Comprehensive reference for dApp developers integrating with the **Ancore Wallet** browser extension. This document details all supported message types, wire postMessage protocol formats, Soroban-specific behavior, and error handling.
-
-For library installation and basic quick-start guides, see [`@ancore/wallet-api`](../packages/wallet-api/README.md).
-
----
-
-## Table of Contents
-
-- [Overview & Architecture](#overview--architecture)
-  - [PostMessage Wire Protocol](#postmessage-wire-protocol)
-  - [Request Envelope](#request-envelope)
-  - [Response Envelope](#response-envelope)
-  - [Ancore vs Classic Stellar Wallets](#ancore-vs-classic-stellar-wallets)
-- [Message Types Reference](#message-types-reference)
-  - [1. `requestAccess`](#1-requestaccess)
-  - [2. `connect`](#2-connect)
-  - [3. `getAddress`](#3-getaddress)
-  - [4. `getPublicKey`](#4-getpublickey)
-  - [5. `getNetwork`](#5-getnetwork)
-  - [6. `isConnected`](#6-isconnected)
-  - [7. `getSmartAccount`](#7-getsmartaccount)
-  - [8. `signTransaction`](#8-signtransaction)
-  - [9. `signAuthEntry`](#9-signauthentry)
-  - [10. `signMessage`](#10-signmessage)
-  - [11. `requestSessionKey`](#11-requestsessionkey)
-  - [12. `signRelayPayload`](#12-signrelaypayload)
-  - [13. `addToken`](#13-addtoken)
-- [Soroban-Specific Behavior](#soroban-specific-behavior)
-  - [Smart Account Identity (C-Address vs G-Address)](#smart-account-identity-c-address-vs-g-address)
-  - [SEP-43 Soroban Authorization Entries](#sep-43-soroban-authorization-entries)
-  - [Session Keys and Granular Policies](#session-keys-and-granular-policies)
-  - [Relayer Meta-Transactions and Fee Abstraction](#relayer-meta-transactions-and-fee-abstraction)
-  - [Contract Deployment Probing](#contract-deployment-probing)
-- [Error Handling & Catalog](#error-handling--catalog)
-  - [Wire Error Envelope](#wire-error-envelope)
-  - [Error Hierarchy in `@ancore/wallet-api`](#error-hierarchy-in-ancorewallet-api)
-  - [Error Catalog](#error-catalog)
-  - [The Two Timeouts Model](#the-two-timeouts-model)
-  - [Typed Error Handling Pattern](#typed-error-handling-pattern)
-- [Integration Walkthrough](#integration-walkthrough)
+> Canonical specification for dApp communication with the Ancore wallet extension.  
+> Covers message envelopes, request/response schemas, all external API methods, Soroban-specific account abstraction behaviors, and Freighter compatibility.
 
 ---
 
-## Overview & Architecture
+## 1. Architecture & Communication Protocol
 
-Communication between dApp web pages and the Ancore Wallet extension takes place over a secure browser bridge:
+dApps communicate with the Ancore wallet extension via an asynchronous bidirectional bridge using `window.postMessage`, mediated by an isolated content script and background service worker.
 
-```text
-dApp Web Page              Content Script             Background Worker          Approval UI
-─────────────              ──────────────             ─────────────────          ───────────
-window.postMessage()  ──>  Validate origin &
-(ANCORE_WALLET_REQUEST)    whitelist method
-                           chrome.runtime.send() ──>  Check allowlist
-                                                      If not allowed:
-                                                      Enqueue request   ───>     Open popup /
-                                                      Wait for decision <───     side-panel UI
-                           chrome.runtime.reply() <── Result / Error
-window.postMessage()  <──  Forward response
-(ANCORE_WALLET_RESPONSE)
+### 1.1 Bridge Topology
+
+```
+┌─────────────────┐       window.postMessage        ┌────────────────────────┐
+│    dApp Page    │ ◄─────────────────────────────► │ Content Script Bridge  │
+│ (@ancore/       │  ANCORE_WALLET_REQUEST          │ (Origin Filter &       │
+│  wallet-api)    │  ANCORE_WALLET_RESPONSE         │  Method Allowlist)     │
+└─────────────────┘                                 └──────────┬─────────────┘
+                                                               │ chrome.runtime
+                                                               │ .sendMessage
+                                                    ┌──────────▼─────────────┐
+                                                    │ Background Service     │
+                                                    │ Worker & Allowlist     │
+                                                    └──────────┬─────────────┘
+                                                               │ Enqueue / Popup
+                                                    ┌──────────▼─────────────┐
+                                                    │ User Approval UI       │
+                                                    │ (Popup / Side Panel)   │
+                                                    └────────────────────────┘
 ```
 
-1. **`@ancore/wallet-api`**: High-level TypeScript client library exposing strongly-typed helper methods.
-2. **Content Script**: Injected at `document_start`. Validates that incoming `window` messages match `ANCORE_WALLET_REQUEST` and only contain allowlisted external methods.
-3. **Background Service Worker**: Verifies site permissions (allowlist keyed by `network`, `smartAccountId`, `origin`), handles cryptographic operations, coordinates session keys, and opens user approval dialogs.
+### 1.2 Two-Layer Security Model
 
-### PostMessage Wire Protocol
+1. **Layer 1 — Content Script Prefilter (`content-script/index.ts`)**:
+   - Validates `event.origin` against permitted protocols (`http:`, `https:`).
+   - Rejects blacklisted prefixes (`chrome-extension://`, `chrome://`, `file://`, `blob:`, `data:`).
+   - Verifies that `event.origin === window.location.origin`.
+   - Enforces an authoritative whitelist of `ExternalApiMethodName`. Unknown methods are dropped before reaching background.
+2. **Layer 2 — Background Allowlist (`background/handlers/external/allowlist.ts`)**:
+   - Authoritative security boundary running in the isolated extension service worker.
+   - Verifies sender origin and maintains a persistent allowlist keyed by `(network, smartAccountId, origin)`.
+   - Privileged methods require prior authorization via `requestAccess` / `connect`.
 
-All inter-frame requests and responses adhere to standard JSON envelopes tagged with protocol identifiers from `@ancore/wallet-shared`.
+### 1.3 Message Envelopes
 
-#### Request Envelope
+#### Request Envelope (`ANCORE_WALLET_REQUEST`)
 
-Messages sent from the dApp page to `window`:
+Sent from the dApp page to the content script:
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "a5482390-50d4-4a2e-8c31-cbb612f0011b",
-  "method": "signTransaction",
-  "params": {
-    "xdr": "AAAAAgAAAAD...",
-    "network": "testnet"
-  }
+```typescript
+interface ExternalRequestEnvelope {
+  /** Identifier constant: 'ANCORE_WALLET_REQUEST' */
+  type: 'ANCORE_WALLET_REQUEST';
+  /** Source tag identifying SDK version: 'ancore-wallet-api@1' */
+  source: 'ancore-wallet-api@1';
+  /** Unique UUID for correlating async responses (response queue pattern) */
+  requestId: string;
+  /** API method name */
+  method: ExternalApiMethodName;
+  /** Method-specific parameters */
+  params?: Record<string, unknown>;
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `type` | `"ANCORE_WALLET_REQUEST"` | Identifies the message as an Ancore wallet request. |
-| `source` | `"ancore-wallet-api@1"` | Protocol source discriminator. |
-| `requestId` | `string` | Unique client-generated correlation ID (e.g. UUIDv4). |
-| `method` | `ExternalApiMethodName` | Method name matching the allowlisted external API methods. |
-| `params` | `object` *(optional)* | Method arguments object. |
+#### Response Envelope (`ANCORE_WALLET_RESPONSE`)
 
-#### Response Envelope
+Returned from the content script to the dApp page:
 
-Messages returned from the content script back to `window`:
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "a5482390-50d4-4a2e-8c31-cbb612f0011b",
-  "ok": true,
-  "result": {
-    "signedXdr": "AAAAAgAAAAD..."
-  }
+```typescript
+interface ExternalResponseEnvelope {
+  /** Identifier constant: 'ANCORE_WALLET_RESPONSE' */
+  type: 'ANCORE_WALLET_RESPONSE';
+  /** Source tag identifying content script: 'ancore-content-script@1' */
+  source: 'ancore-content-script@1';
+  /** Correlation UUID matching the request */
+  requestId: string;
+  /** Whether the operation succeeded */
+  ok: boolean;
+  /** Result payload on success */
+  result?: unknown;
+  /** Error message on failure */
+  error?: string;
 }
 ```
-
-When an operation fails:
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "a5482390-50d4-4a2e-8c31-cbb612f0011b",
-  "ok": false,
-  "error": "User rejected the sign request"
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `type` | `"ANCORE_WALLET_RESPONSE"` | Identifies the message as an Ancore wallet response. |
-| `source` | `"ancore-content-script@1"` | Content script source discriminator. |
-| `requestId` | `string` | Matches the `requestId` of the originating request. |
-| `ok` | `boolean` | `true` if successful; `false` on rejection or error. |
-| `result` | `unknown` *(optional)* | Result payload when `ok` is `true`. |
-| `error` | `string` *(optional)* | Error message string when `ok` is `false`. |
 
 ---
 
-### Ancore vs Classic Stellar Wallets
+## 2. External API Methods
 
-| Feature | Classic Stellar (e.g. Freighter) | Ancore Account Abstraction |
-|---|---|---|
-| **Primary Account ID** | Ed25519 Public Key (`G...`, 56 chars) | Soroban Smart Contract ID (`C...`, 56 chars) |
-| **Owner Key** | Primary signing key | Secret key / hardware key controlling the contract |
-| **Transaction Signing** | Ed25519 signature on transaction hash | Contract invocation signature or SEP-43 auth entry |
-| **Gas / Fees** | Source account pays native XLM fees | Can be sponsored via Relayer (`submitViaRelayer`) |
-| **Micro-interactions** | User approval popup on every tx | Scoped **Session Keys** with limits & expiration |
+### Summary Matrix
+
+| Method | Description | Requires Allowlist / User Approval | Freighter Equivalent |
+|---|---|---|---|
+| [`requestAccess`](#requestaccess) | Connect dApp to wallet and request permissions | Yes (User prompt if not allowlisted) | `requestAccess` |
+| [`connect`](#connect) | Connect and return smart account address | Yes (User prompt if not allowlisted) | `requestAccess` |
+| [`getAddress`](#getaddress) | Get active smart account address without prompt | Yes (Cached allowlist check) | `getAddress` |
+| [`getNetwork`](#getnetwork) | Get active Stellar network name | No (Public read) | `getNetwork` |
+| [`isConnected`](#isconnected) | Check if origin is allowlisted | No (Public check) | `isConnected` |
+| [`getSmartAccount`](#getsmartaccount) | Get smart account metadata and deployment status | Yes (Cached allowlist check) | *(Ancore specific)* |
+| [`getPublicKey`](#getpublickey) | Get public identity of the account | Yes (Cached allowlist check) | `getPublicKey` |
+| [`signTransaction`](#signtransaction) | Sign transaction XDR (supports AA relayer submit) | Yes (User confirmation UI) | `signTransaction` |
+| [`signAuthEntry`](#signauthentry) | Sign Soroban SEP-43 authorization entry | Yes (User confirmation UI) | `signAuthEntry` |
+| [`signMessage`](#signmessage) | Sign arbitrary message with owner key | Yes (User confirmation UI) | `signMessage` |
+| [`requestSessionKey`](#requestsessionkey) | Request delegated session key with scoped policy | Yes (User confirmation UI) | *(Ancore specific)* |
+| [`signRelayPayload`](#signrelaypayload) | Sign canonical gasless meta-transaction payload | Yes (User confirmation UI) | *(Ancore specific)* |
+| [`addToken`](#addtoken) | Request adding a SAC token or trustline | Yes (User confirmation UI) | *(Freighter token UI)* |
 
 ---
 
-## Message Types Reference
+### `requestAccess`
 
-### 1. `requestAccess`
+Prompts the user to connect their smart account to the dApp origin. If already allowlisted for the active network and account, resolves immediately.
 
-Prompts the user to grant permission for the calling dApp origin to interact with their active smart account. If the origin is already on the allowlist for the current network and account, resolves immediately without opening an approval window.
+#### Request
 
-#### Wire Request
+```typescript
+// Method: 'requestAccess'
+// Params: None (or optional prompt reason)
+```
+
+#### Response (`RequestAccessResult`)
 
 ```json
 {
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "6cf7e721-70e2-4bd5-8f6a-0466be9794cb",
-  "method": "requestAccess",
-  "params": {
-    "network": "testnet"
-  }
+  "smartAccountId": "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE",
+  "ownerPublicKey": "GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTAYXE75AFN",
+  "network": "testnet"
 }
 ```
 
-#### Wire Response
+- `smartAccountId`: Deployed Soroban smart account contract ID (`C...`).
+- `ownerPublicKey`: Owner Ed25519 public key (`G...`), useful for Horizon balance/signer queries.
+- `network`: Active network name (`testnet`, `mainnet`, `futurenet`, `local`).
 
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "6cf7e721-70e2-4bd5-8f6a-0466be9794cb",
-  "ok": true,
-  "result": {
-    "smartAccountId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "ownerPublicKey": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-    "network": "testnet"
-  }
-}
-```
-
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { requestAccess } from '@ancore/wallet-api';
 
-const { smartAccountId, ownerPublicKey, network } = await requestAccess();
-console.log(`Connected to smart account ${smartAccountId} on ${network}`);
+try {
+  const access = await requestAccess();
+  console.log('Connected smart account:', access.smartAccountId);
+  console.log('Owner public key:', access.ownerPublicKey);
+  console.log('Network:', access.network);
+} catch (err) {
+  console.error('Connection rejected by user:', err);
+}
 ```
 
 ---
 
-### 2. `connect`
+### `connect`
 
-High-level connection convenience method mirroring `requestAccess`. If not already allowlisted, prompts the user for access. Resolves directly with the primary smart account contract C-address.
+Convenience wrapper around `requestAccess` that resolves directly to the smart account contract ID string.
 
-#### Wire Request
+#### Request
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "8f8b82e2-0f5a-4eb3-81b0-4660d5bfa4a3",
-  "method": "connect",
-  "params": {}
-}
+```typescript
+// Method: 'connect'
+// Params: None
 ```
 
-#### Wire Response
+#### Response
 
 ```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "8f8b82e2-0f5a-4eb3-81b0-4660d5bfa4a3",
-  "ok": true,
-  "result": {
-    "smartAccountId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "network": "testnet"
-  }
-}
+"CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE"
 ```
 
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { connect } from '@ancore/wallet-api';
 
 const smartAccountId = await connect();
-// Returns string: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 ```
 
 ---
 
-### 3. `getAddress`
+### `getAddress`
 
-Returns the active smart account address and optional owner public key without triggering any user prompt. Requires that the calling origin has already been approved via `requestAccess` or `connect`.
+Returns the connected smart account address without opening a prompt if the origin has already been allowlisted. Throws `WalletNotInstalledError` if the extension does not respond within timeout (500ms).
 
-#### Wire Request
+#### Request
+
+```typescript
+// Method: 'getAddress'
+// Params: None
+```
+
+#### Response (`GetAddressResult`)
 
 ```json
 {
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "d258cb21-2e5b-4c4f-9e79-cb4ecb5eb541",
-  "method": "getAddress",
-  "params": {}
+  "smartAccountId": "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE",
+  "ownerPublicKey": "GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTAYXE75AFN"
 }
 ```
 
-#### Wire Response
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "d258cb21-2e5b-4c4f-9e79-cb4ecb5eb541",
-  "ok": true,
-  "result": {
-    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "network": "testnet",
-    "ownerPublicKey": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
-  }
-}
-```
-
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { getAddress } from '@ancore/wallet-api';
@@ -274,74 +205,28 @@ import { getAddress } from '@ancore/wallet-api';
 const { smartAccountId, ownerPublicKey } = await getAddress();
 ```
 
-> **Note:** If the origin is not allowlisted, the background worker rejects with `"Origin not allowed. Call requestAccess first."`.
-
 ---
 
-### 4. `getPublicKey`
+### `getNetwork`
 
-Returns the primary public identity address of the active account. In Ancore, this returns the deployed smart-account C-address (stored in extension storage). Requires prior access approval.
+Returns the active Stellar network configured in the wallet. Does not require user approval or prior connection.
 
-#### Wire Request
+#### Request
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "b3e34320-1bfa-4c55-bfa3-f47de023ba11",
-  "method": "getPublicKey",
-  "params": {}
-}
+```typescript
+// Method: 'getNetwork'
+// Params: None
 ```
 
-#### Wire Response
+#### Response
 
 ```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "b3e34320-1bfa-4c55-bfa3-f47de023ba11",
-  "ok": true,
-  "result": {
-    "publicKey": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  }
-}
+"testnet"
 ```
 
----
+*Supported values*: `"mainnet" | "testnet" | "futurenet" | "local"`.
 
-### 5. `getNetwork`
-
-Queries the active Stellar network currently selected in the extension settings. Returns the network name and its official network passphrase.
-
-#### Wire Request
-
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "6d92ec17-30e4-4fa9-b883-7d2d3a3d66fe",
-  "method": "getNetwork",
-  "params": {}
-}
-```
-
-#### Wire Response
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "6d92ec17-30e4-4fa9-b883-7d2d3a3d66fe",
-  "ok": true,
-  "result": {
-    "network": "testnet",
-    "networkPassphrase": "Test SDF Network ; September 2015"
-  }
-}
-```
-
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { getNetwork } from '@ancore/wallet-api';
@@ -351,658 +236,452 @@ const network = await getNetwork(); // 'mainnet' | 'testnet' | 'futurenet' | 'lo
 
 ---
 
-### 6. `isConnected`
+### `isConnected`
 
-Silent check to verify whether the dApp origin is currently allowlisted for the active smart account on the current network. Never prompts the user.
+Checks whether the current origin is allowlisted for the active smart account on the active network.
 
-#### Wire Request
+#### Request
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "50c4bb21-2ef3-4011-8c43-c90a82e9b08f",
-  "method": "isConnected",
-  "params": {}
-}
+```typescript
+// Method: 'isConnected'
+// Params: None
 ```
 
-#### Wire Response
+#### Response
 
 ```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "50c4bb21-2ef3-4011-8c43-c90a82e9b08f",
-  "ok": true,
-  "result": {
-    "connected": true
-  }
-}
+true
 ```
 
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { isConnected } from '@ancore/wallet-api';
 
 if (await isConnected()) {
-  // Safe to read address without user prompt
+  console.log('dApp is authorized');
 }
 ```
 
 ---
 
-### 7. `getSmartAccount`
+### `getSmartAccount`
 
-Ancore-specific extension method providing full smart account status, including on-chain contract deployment verification via Soroban RPC.
+Returns comprehensive metadata regarding the smart account contract, including on-chain deployment status.
 
-#### Wire Request
+#### Request
+
+```typescript
+// Method: 'getSmartAccount'
+// Params: None
+```
+
+#### Response (`GetSmartAccountResult`)
 
 ```json
 {
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "79b32948-43ec-44f2-a0bb-2647cbf2ad6a",
-  "method": "getSmartAccount",
-  "params": {}
+  "contractId": "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE",
+  "deploymentStatus": "deployed",
+  "network": "testnet",
+  "ownerPublicKey": "GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTAYXE75AFN"
 }
 ```
 
-#### Wire Response
+- `deploymentStatus`:
+  - `"deployed"`: Account contract exists on-chain and responded to RPC probe.
+  - `"pending"`: Account deployment transaction has been submitted and is awaiting inclusion.
+  - `"not_deployed"`: Counterfactual address derived deterministically, contract has not yet been initialized on-chain.
+  - `"unknown"`: RPC check encountered a transient network/infra failure.
 
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "79b32948-43ec-44f2-a0bb-2647cbf2ad6a",
-  "ok": true,
-  "result": {
-    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "deploymentStatus": "deployed",
-    "network": "testnet"
-  }
-}
-```
-
-| Deployment Status | Meaning |
-|---|---|
-| `"deployed"` | Contract is initialized and live on the network (verified via RPC simulation). |
-| `"not_deployed"` | Account address is derived/configured, but contract instance is not found on-chain. |
-| `"pending"` | Deployment transaction is currently being processed. |
-| `"unknown"` | Network/RPC unreachable; status could not be verified. |
-
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { getSmartAccount } from '@ancore/wallet-api';
 
 const account = await getSmartAccount();
-if (account.deployed) {
-  console.log(`Ready for Soroban calls: ${account.smartAccountId}`);
+if (account.deploymentStatus === 'not_deployed') {
+  console.log('Contract is counterfactual — will deploy on first sponsored call');
 }
 ```
 
 ---
 
-### 8. `signTransaction`
+### `getPublicKey`
 
-Requests user signature on a Stellar / Soroban transaction XDR. Opens an approval window displaying transaction details, operations, memo, and estimated fee.
+Returns the primary public identity of the account. In Ancore account abstraction, this returns the deployed smart-account `C...` contract identifier.
 
-#### Wire Request
+#### Request
+
+```typescript
+// Method: 'getPublicKey'
+// Params: None
+```
+
+#### Response
 
 ```json
 {
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "e1586a51-93c1-4775-bf7d-5a93d4040bf5",
-  "method": "signTransaction",
-  "params": {
-    "xdr": "AAAAAgAAAADl3J8VvW249zK...",
-    "networkPassphrase": "Test SDF Network ; September 2015",
-    "submitViaRelayer": false
-  }
+  "publicKey": "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE"
 }
 ```
 
-#### Parameters
+---
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `xdr` | `string` | Yes | Base64-encoded transaction envelope XDR. |
-| `networkPassphrase` | `string` | No | Overrides the network passphrase for signature verification. |
-| `submitViaRelayer` | `boolean` | No | When `true`, delegates fee payment and submission to the Ancore relayer. |
+### `signTransaction`
 
-#### Wire Response
+Requests user signature on a Stellar or Soroban transaction envelope XDR. The extension validates the XDR, parses operations, performs Soroban simulation preview, and prompts the user for approval.
+
+#### Request Parameters (`SignTransactionParams`)
+
+```typescript
+interface SignTransactionParams {
+  /** Base64-encoded Stellar TransactionEnvelope XDR */
+  xdr: string;
+  /** Target network passphrase (optional; defaults to wallet active network) */
+  networkPassphrase?: string;
+  /** When true, submits the transaction via the Ancore Relayer after signing */
+  submitViaRelayer?: boolean;
+}
+```
+
+#### Response (`SignTransactionResult`)
 
 ```json
 {
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "e1586a51-93c1-4775-bf7d-5a93d4040bf5",
-  "ok": true,
-  "result": {
-    "signedXdr": "AAAAAgAAAADl3J8VvW249zK...signed...",
-    "txHash": "a1b2c3d4e5f6..."
-  }
+  "signedXdr": "AAAAAgAAAAA...",
+  "txHash": "a1b2c3d4e5f6..."
 }
 ```
 
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { signTransaction } from '@ancore/wallet-api';
 
-const { signedXdr, txHash } = await signTransaction({
-  xdr: unsignedXdr,
+const result = await signTransaction({
+  xdr: 'AAAAAgAAAAB...',
   networkPassphrase: 'Test SDF Network ; September 2015',
   submitViaRelayer: false,
 });
+console.log('Signed XDR:', result.signedXdr);
 ```
 
 ---
 
-### 9. `signAuthEntry`
+### `signAuthEntry`
 
-Signs a Soroban authorization entry (`SorobanAuthorizationEntry` XDR, SEP-43). Required for invoking smart account methods where the user's contract address is specified in contract credentials.
+Signs a Soroban `SorobanAuthorizationEntry` (SEP-43). Used for cross-contract authorizations, SAC token approvals, and meta-invocations without submitting a full transaction envelope.
 
-#### Wire Request
+#### Request Parameters
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "5c18ee11-b0e6-4221-a392-7489679fce90",
-  "method": "signAuthEntry",
-  "params": {
-    "authEntry": "AAAAEAAAAAE...",
-    "networkPassphrase": "Test SDF Network ; September 2015"
-  }
+```typescript
+interface SignAuthEntryParams {
+  /** Base64-encoded SorobanAuthorizationEntry XDR */
+  authEntryXdr: string;
+  /** Network passphrase */
+  networkPassphrase?: string;
 }
 ```
 
-#### Wire Response
+#### Response
 
 ```json
 {
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "5c18ee11-b0e6-4221-a392-7489679fce90",
-  "ok": true,
-  "result": {
-    "signedAuthEntry": "AAAAEAAAAAE...signed..."
-  }
+  "signedAuthEntry": "AAAAAgAAAAC..."
 }
 ```
 
-#### Soroban-Specific Behavior
-- **Validation Before Prompt:** The wallet validates that `authEntry` is non-empty and valid base64 before opening the approval window. If invalid, fails immediately with `"Invalid auth entry XDR"`.
-- **Root Invocation Inspection:** The approval UI decodes the `SorobanAuthorizedInvocation` inside the auth entry, showing the user the exact contract ID, function name, and arguments being authorized.
-
-#### TypeScript SDK Usage
+#### TypeScript SDK Example
 
 ```typescript
 import { signAuthEntry } from '@ancore/wallet-api';
 
 const { signedAuthEntry } = await signAuthEntry({
   authEntryXdr: rawAuthEntryXdr,
-  networkPassphrase: 'Test SDF Network ; September 2015',
 });
 ```
 
 ---
 
-### 10. `signMessage`
+### `signMessage`
 
-Signs an arbitrary UTF-8 string or message challenge (SEP-53 format). Opens an approval screen showing the plain-text message.
+Signs an arbitrary binary or text payload using the account's signing key (SEP-53 format).
 
-#### Wire Request
+#### Request Parameters
 
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "129ae7d9-35da-4856-b072-bc32fa5a7749",
-  "method": "signMessage",
-  "params": {
-    "message": "Authenticate to MyApp at 2026-09-30T12:00:00Z"
-  }
+```typescript
+interface SignMessageParams {
+  /** Plaintext message or hex-encoded string to sign */
+  message: string;
+  /** Network passphrase */
+  networkPassphrase?: string;
 }
 ```
 
-#### Wire Response
+#### Response
 
 ```json
 {
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "129ae7d9-35da-4856-b072-bc32fa5a7749",
-  "ok": true,
-  "result": {
-    "signature": "3f4a9b2c..."
-  }
+  "signedMessage": "9a8b7c6d5e4f..."
 }
 ```
 
-#### TypeScript SDK Usage
+*Note: Returns hex-encoded Ed25519 signature string.*
+
+#### TypeScript SDK Example
 
 ```typescript
 import { signMessage } from '@ancore/wallet-api';
 
 const { signedMessage } = await signMessage({
-  message: 'Authenticate to MyApp at 2026-09-30T12:00:00Z',
-});
-// signedMessage is the hex-encoded signature
-```
-
----
-
-### 11. `requestSessionKey`
-
-Requests the user's smart account to grant a temporary, scoped **Session Key**. This enables dApps to execute limited interactions (such as automated swaps, gaming actions, or micro-transactions) without prompting user confirmation on every single transaction.
-
-#### Wire Request
-
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "812fce4d-d79e-4c74-a698-c174345d2e08",
-  "method": "requestSessionKey",
-  "params": {
-    "expiresAt": 1790774400000,
-    "permissions": 3,
-    "allowedContracts": [
-      "CBPDNZG26J2AWZMWWW2I6K5WZEZ6O27Z37PFFC3CJJR7SSQY3U4GZ244"
-    ],
-    "maxAmountPerCall": "100000000"
-  }
-}
-```
-
-#### Parameters (`SessionKeyPolicy`)
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `expiresAt` | `number` | Yes | Future Unix timestamp in milliseconds when the key expires. |
-| `permissions` | `number` | Yes | Non-negative integer bitmask matching on-chain session key permissions. |
-| `allowedContracts` | `string[]` | No | Optional array of contract C-addresses the session key is permitted to call. |
-| `maxAmountPerCall` | `string` | No | Optional numeric string specifying spend limit per invocation in stroops. |
-
-#### Wire Response
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "812fce4d-d79e-4c74-a698-c174345d2e08",
-  "ok": true,
-  "result": {
-    "publicKey": "GDUXQWVQ273767...",
-    "expiresAt": 1790774400000
-  }
-}
-```
-
-#### TypeScript SDK Usage
-
-```typescript
-import { requestSessionKey } from '@ancore/wallet-api';
-
-const oneDayFromNow = Date.now() + 24 * 60 * 60 * 1000;
-const sessionKey = await requestSessionKey({
-  expiresAt: oneDayFromNow,
-  permissions: 1, // e.g. CallContract permission
-  allowedContracts: ['CBPDNZG26J2AWZMWWW2I6K5WZEZ6O27Z37PFFC3CJJR7SSQY3U4GZ244'],
-  maxAmountPerCall: '50000000', // 5 XLM
-});
-
-console.log('Session Public Key:', sessionKey.publicKey);
-```
-
----
-
-### 12. `signRelayPayload`
-
-Signs a canonical meta-transaction envelope designed for submission to the Ancore platform relayer (`/relay/execute`, issue #1213). The wallet generates the session key signature and canonical payload atomically.
-
-#### Wire Request
-
-```json
-{
-  "type": "ANCORE_WALLET_REQUEST",
-  "source": "ancore-wallet-api@1",
-  "requestId": "9db2a191-2483-4a11-8e93-27eb69c6e392",
-  "method": "signRelayPayload",
-  "params": {
-    "operation": "transfer",
-    "nonce": 42,
-    "to": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "amount": "10000000",
-    "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-  }
-}
-```
-
-#### Wire Response
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "9db2a191-2483-4a11-8e93-27eb69c6e392",
-  "ok": true,
-  "result": {
-    "sessionKey": "GBLZX37...",
-    "signature": "8a7f9b0c..."
-  }
-}
-```
-
-#### TypeScript SDK Usage
-
-```typescript
-import { signRelayPayload } from '@ancore/wallet-api';
-
-const { sessionKey, signature } = await signRelayPayload({
-  operation: 'transfer',
-  nonce: 1,
-  to: recipientAddress,
-  amount: '50000000',
-  asset: sacContractAddress,
+  message: 'Authenticate session for dApp xyz at timestamp 1714000000',
 });
 ```
 
 ---
 
-### 13. `addToken`
+### `requestSessionKey`
 
-Token discovery and management in Ancore differs from classic Stellar trustlines:
+Requests the user to grant a delegated, scoped session key on their smart account. The extension prompts the user with permission scopes, allowed contract targets, duration, and maximum spend limits.
 
-- **Classic Stellar:** Requires an explicit `ChangeTrust` operation on a classic G-account before receiving non-native assets.
-- **Soroban Smart Accounts:** Use **Soroban Asset Contracts (SAC)** or custom token contracts (`C...`). Contracts do not require classic trustlines; balances are stored in contract ledger data.
-
-When migrating from Freighter:
-- Freighter's `addToken` (SEP-0007 / watchAsset) adds a classic trustline or notifies the UI to track a token.
-- In Ancore, token discovery and tracking are managed through Soroban Asset Contract addresses. dApps can pass token C-addresses when preparing invocations or meta-transactions.
-- Future versions of the extension will expose an explicit `watchAsset` / `addToken` external method to pin custom SAC tokens into the extension asset list.
-
----
-
-## Soroban-Specific Behavior
-
-### Smart Account Identity (C-Address vs G-Address)
-
-Ancore uses the native Soroban account abstraction architecture:
-1. Every user has a **Smart Account contract** deployed on-chain (`C...`).
-2. The user holds an underlying Ed25519 signer key (`G...`), but this key is an **owner/admin** key, not the primary account.
-3. dApps query `getAddress()` and receive `smartAccountId` (`C...`). Smart contract invocations should specify this C-address as the source/caller.
-
-### SEP-43 Soroban Authorization Entries
-
-When invoking Soroban smart contracts on behalf of a smart account:
-1. Build the transaction containing the `InvokeHostFunction` operation.
-2. The authorization entry requires a signature from the smart account.
-3. Call `signAuthEntry({ authEntryXdr })` to prompt the wallet to generate the correct Soroban signature credentials (`SorobanCredentials`).
-
-### Session Keys and Granular Policies
-
-Session keys allow sub-delegation:
-- **Time-bound:** Automatically expire after `expiresAt`.
-- **Scope-bound:** Limited to specific contracts (`allowedContracts`).
-- **Value-bound:** Maximum spend caps (`maxAmountPerCall`).
-The extension enforces policies both locally in the background worker and on-chain in the smart account contract.
-
-### Relayer Meta-Transactions and Fee Abstraction
-
-dApps do not need to require users to fund their smart account with native XLM before taking action:
-- Transactions marked with `submitViaRelayer: true` or signed via `signRelayPayload` are submitted via the Ancore Relayer service.
-- The relayer wraps the invocation in a sponsored transaction envelope, paying gas fees on behalf of the user.
-
-### Contract Deployment Probing
-
-Before submitting contract calls, dApps can check whether the account contract is already deployed on the active network:
-```typescript
-import { getSmartAccount } from '@ancore/wallet-api';
-
-const { deployed, smartAccountId } = await getSmartAccount();
-if (!deployed) {
-  // Show prompt explaining the smart account requires initial activation/deployment
-}
-```
-
----
-
-## Error Handling & Catalog
-
-### Wire Error Envelope
-
-All failed requests reject the promise with a `WalletApiError`. Over the wire, the response envelope has `ok: false`:
-
-```json
-{
-  "type": "ANCORE_WALLET_RESPONSE",
-  "source": "ancore-content-script@1",
-  "requestId": "...",
-  "ok": false,
-  "error": "<error string>"
-}
-```
-
-### Error Hierarchy in `@ancore/wallet-api`
-
-```text
-Error
- └── WalletApiError
-      └── WalletNotInstalledError
-```
-
-- **`WalletApiError`**: Base class for all errors thrown by `@ancore/wallet-api`.
-- **`WalletNotInstalledError`**: Thrown when the content script does not reply (extension not installed or unavailable).
+#### Request Parameters (`SessionKeyPolicy`)
 
 ```typescript
-import { WalletApiError, WalletNotInstalledError } from '@ancore/wallet-api';
-
-try {
-  await connect();
-} catch (err) {
-  if (err instanceof WalletNotInstalledError) {
-    // Prompt user to install Ancore extension
-  } else if (err instanceof WalletApiError) {
-    // Handle wallet logic / user rejection error
-  }
-}
-```
-
----
-
-### Error Catalog
-
-The table below lists all standard error messages generated across the wallet bridge and background handlers:
-
-| Error Message (`error.message`) | Origin | Cause | Recommended Action |
-|---|---|---|---|
-| `wallet-api requires a browser window` | `@ancore/wallet-api` bridge | Called in SSR / Node.js environment where `window` is undefined | Ensure wallet methods are only called on the client side |
-| `Request timed out after 30000ms` | `@ancore/wallet-api` bridge | Bridge received no reply within 30 seconds | Prompt user to install wallet or check if extension is disabled |
-| `Ancore extension not detected...` | `WalletNotInstalledError` | No response received within probe timeout | Display "Install Extension" UI |
-| `Origin not allowed. Call requestAccess first.` | Background handler | Calling origin is not allowlisted for the active account | Call `connect()` or `requestAccess()` before calling privileged methods |
-| `Wallet not set up. Complete onboarding first.` | Background handler | Extension is installed but user has not created/imported a vault | Prompt user to complete wallet onboarding |
-| `User rejected the sign request` | Approval UI | User clicked **Reject** in the approval window | Treat as user cancellation; do not display as a fatal failure |
-| `Access request was not approved.` | Background handler | User declined origin connection | Cancel connection flow gracefully |
-| `Approval request expired after 5 minutes...` | Background handler | Approval window was ignored or left open past the 5-minute timeout | Prompt user to retry the operation |
-| `Invalid signTransaction params: ...` | Background handler | Parameter validation failed (e.g. empty or malformed XDR) | Verify transaction builder output |
-| `Invalid auth entry XDR` | Background handler | Auth entry string is empty or invalid base64 | Check Soroban auth entry simulation output |
-| `Invalid signMessage params: ...` | Background handler | Empty or malformed message payload | Provide non-empty string |
-| `Invalid session key params: ...` | Background handler | Policy violates validation rules (e.g. invalid C-address) | Ensure contract addresses follow `C...` format |
-| `Session key policy must include a future expiresAt timestamp.` | Background handler | `expiresAt` is in the past or zero | Provide future Unix timestamp in milliseconds |
-| `Unknown method: <method>` | Content script | Requested method is not in the allowlist | Verify SDK and extension version compatibility |
-| `Unknown external API method: <method>` | Background worker | Method bypassed content script but has no background handler | Check extension version |
-| `Invalid origin` / `Origin mismatch` | Service worker | Security violation: sender origin mismatch | Security error; do not retry |
-
----
-
-### The Two Timeouts Model
-
-When performing operations requiring user approval (`signTransaction`, `signAuthEntry`, `requestSessionKey`, `signMessage`):
-
-1. **dApp Bridge Timeout (30 seconds):** The client-side `sendExternalRequest` timer rejects after 30s by default to prevent hanging client promises.
-2. **Wallet Approval Timeout (5 minutes):** The extension background worker keeps the request in the queue for 5 minutes before discarding it.
-
-> **Important:** If a user takes longer than 30 seconds to review a transaction, the dApp bridge may time out while the extension approval window remains open. Always check `isConnected()` or prompt the user before initiating an automatic retry.
-
----
-
-### Typed Error Handling Pattern
-
-Use the following helper to cleanly classify errors in dApp frontends:
-
-```typescript
-import { WalletApiError, WalletNotInstalledError } from '@ancore/wallet-api';
-
-export type WalletErrorKind =
-  | 'NOT_INSTALLED'
-  | 'USER_REJECTED'
-  | 'UNAUTHORIZED'
-  | 'NOT_ONBOARDED'
-  | 'TIMEOUT'
-  | 'INVALID_PARAMS'
-  | 'UNKNOWN';
-
-export interface ParsedWalletError {
-  kind: WalletErrorKind;
-  message: string;
-  isUserActionable: boolean;
-  canRetry: boolean;
-}
-
-export function parseWalletError(error: unknown): ParsedWalletError {
-  if (error instanceof WalletNotInstalledError) {
-    return {
-      kind: 'NOT_INSTALLED',
-      message: 'Ancore Wallet extension is not installed.',
-      isUserActionable: true,
-      canRetry: false,
-    };
-  }
-
-  if (error instanceof WalletApiError || error instanceof Error) {
-    const msg = error.message;
-
-    if (msg.includes('rejected') || msg.includes('not approved')) {
-      return {
-        kind: 'USER_REJECTED',
-        message: 'Request was cancelled by user.',
-        isUserActionable: false,
-        canRetry: true,
-      };
-    }
-
-    if (msg.includes('Origin not allowed')) {
-      return {
-        kind: 'UNAUTHORIZED',
-        message: 'Site not connected to wallet. Please connect first.',
-        isUserActionable: true,
-        canRetry: true,
-      };
-    }
-
-    if (msg.includes('Wallet not set up')) {
-      return {
-        kind: 'NOT_ONBOARDED',
-        message: 'Wallet onboarding incomplete. Please finish wallet setup.',
-        isUserActionable: true,
-        canRetry: false,
-      };
-    }
-
-    if (msg.includes('timed out') || msg.includes('expired')) {
-      return {
-        kind: 'TIMEOUT',
-        message: 'Wallet request timed out. Please try again.',
-        isUserActionable: true,
-        canRetry: true,
-      };
-    }
-
-    if (msg.startsWith('Invalid')) {
-      return {
-        kind: 'INVALID_PARAMS',
-        message: `Invalid request payload: ${msg}`,
-        isUserActionable: false,
-        canRetry: false,
-      };
-    }
-  }
-
-  return {
-    kind: 'UNKNOWN',
-    message: error instanceof Error ? error.message : 'Unknown wallet error occurred.',
-    isUserActionable: false,
-    canRetry: true,
+interface SessionKeyPolicy {
+  /** Unix timestamp in seconds when the session key must expire */
+  expiresAt: number;
+  /** Additive permission flags (0 = SEND_PAYMENT, 1 = MANAGE_DATA, 2 = INVOKE_CONTRACT) */
+  permissions: number | number[];
+  /** Allowed target contract C... addresses (optional; empty = unrestricted) */
+  allowedContracts?: string[];
+  /** Maximum payment amount authorized per call in decimal format (e.g. "50.0") */
+  maxAmountPerCall?: string;
+  /** Total spend budget authorized across the lifetime of the session key */
+  spendLimit?: {
+    asset: string;
+    maxAmount: string;
   };
 }
 ```
 
----
+#### Response (`RequestSessionKeyResult`)
 
-## Integration Walkthrough
+```json
+{
+  "sessionKey": {
+    "publicKey": "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVTOO",
+    "permissions": [0, 2],
+    "expiresAt": 1714003600,
+    "label": "Swap Bot Key"
+  },
+  "transactionHash": "8f3b..."
+}
+```
 
-Below is a complete end-to-end example demonstrating connection, network verification, Soroban contract authorization, and transaction signing:
+#### TypeScript SDK Example
 
 ```typescript
-import {
-  connect,
-  getAddress,
-  getNetwork,
-  getSmartAccount,
-  signTransaction,
-  signAuthEntry,
-  WalletNotInstalledError,
-} from '@ancore/wallet-api';
-import { parseWalletError } from './walletErrorHelper';
+import { requestSessionKey } from '@ancore/wallet-api';
 
-async function executeDappAction(unsignedTxXdr: string, authEntryXdr?: string) {
-  try {
-    // 1. Connect dApp to user's smart account
-    const smartAccountId = await connect();
-    console.log('Connected smart account:', smartAccountId);
+const session = await requestSessionKey({
+  expiresAt: Math.floor(Date.now() / 1000) + 3600, // 1 hour
+  permissions: [0, 2], // SEND_PAYMENT and INVOKE_CONTRACT
+  allowedContracts: ['CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'],
+  maxAmountPerCall: '10.0',
+});
 
-    // 2. Validate active network
-    const network = await getNetwork();
-    if (network !== 'testnet') {
-      throw new Error(`Please switch your Ancore Wallet to testnet (currently on ${network})`);
-    }
+console.log('Delegated session key public key:', session.sessionKey.publicKey);
+```
 
-    // 3. Confirm smart account deployment status
-    const accountInfo = await getSmartAccount();
-    if (!accountInfo.deployed) {
-      console.warn('Smart account is not yet deployed on-chain.');
-    }
+---
 
-    // 4. If interacting with a contract requiring SEP-43 auth entry:
-    if (authEntryXdr) {
-      const { signedAuthEntry } = await signAuthEntry({
-        authEntryXdr,
-      });
-      console.log('Signed Auth Entry:', signedAuthEntry);
-    }
+### `signRelayPayload`
 
-    // 5. Sign the main transaction envelope
-    const { signedXdr } = await signTransaction({
-      xdr: unsignedTxXdr,
-      submitViaRelayer: false,
-    });
+Generates and signs a canonical gasless meta-transaction payload for execution via the Ancore platform relayer (`/relay/execute`). Atomically computes the required session key and returns the signature and public key together.
 
-    return signedXdr;
-  } catch (err) {
-    const parsed = parseWalletError(err);
-    if (parsed.kind === 'USER_REJECTED') {
-      console.log('User cancelled signing.');
-      return null;
-    }
+#### Request Parameters
 
-    console.error(`Wallet operation failed (${parsed.kind}):`, parsed.message);
-    throw err;
-  }
+```typescript
+interface SignRelayPayloadParams {
+  /** Contract operation name (e.g. 'transfer') */
+  operation: string;
+  /** Current account nonce for replay protection */
+  nonce: number;
+  /** Destination address (G... or C...) */
+  to: string;
+  /** Decimal transfer amount (e.g. '25.5000000') */
+  amount: string;
+  /** Asset identifier ('native' or 'CODE:ISSUER' or SAC C-address) */
+  asset: string;
+}
+```
+
+#### Response (`SignRelayPayloadResult`)
+
+```json
+{
+  "sessionKey": "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVTOO",
+  "signature": "c4d5e6f7a8b9..."
+}
+```
+
+#### TypeScript SDK Example
+
+```typescript
+import { signRelayPayload } from '@ancore/wallet-api';
+
+const relayPayload = await signRelayPayload({
+  operation: 'transfer',
+  nonce: 4,
+  to: 'GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTAYXE75AFN',
+  amount: '50.0000000',
+  asset: 'native',
+});
+
+// Submit to platform relayer endpoint:
+// POST /relay/execute with { ...relayPayload }
+```
+
+---
+
+### `addToken`
+
+Requests the wallet to track or establish a trustline / Soroban SAC token entry for a specific asset.
+
+#### Request Parameters
+
+```typescript
+interface AddTokenParams {
+  /** Token type: 'soroban' for SAC contracts, or classic 'credit_alphanum4' / 'credit_alphanum12' */
+  type: 'soroban' | 'credit_alphanum4' | 'credit_alphanum12';
+  /** Asset code (e.g. 'USDC', 'EURC') */
+  code: string;
+  /** Issuer G-address (for classic Stellar assets) */
+  issuer?: string;
+  /** Soroban contract C-address (for SAC / SEP-41 tokens) */
+  contractId?: string;
+}
+```
+
+#### Response
+
+```json
+{
+  "success": true,
+  "asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+}
+```
+
+---
+
+## 3. Soroban-Specific Account Abstraction Details
+
+### 3.1 Smart Account Identity (`C...`) vs Owner Key (`G...`)
+
+Classic Stellar wallets represent identity via an Ed25519 public key starting with `G...`. In Ancore:
+- The **Smart Account Address** is a Soroban Contract ID (`C...`).
+- The **Owner Key** (`G...`) holds administrative keys and passes signatures to the contract.
+- Invocations to protocols (e.g. Soroswap, Blend) identify the user by their `C...` address.
+
+```
+Smart Account Identity: C... (Passed to Soroban contracts as Address)
+  └── Owner Key: G... (Used to sign SorobanAuthorizationEntries & admin ops)
+  └── Session Keys: [G1..., G2...] (Delegated keys with scoped policies)
+```
+
+### 3.2 CREATE2-Style Counterfactual Address Derivation
+
+Smart account addresses are deterministically pre-computed offline before contract deployment:
+
+$$\text{Preimage} = \text{HashIdPreimage::ContractId}(\text{NetworkId}, \text{FromAddress}(\text{Deployer: } \text{Owner}, \text{Salt: } 0^{32}))$$
+
+$$\text{ContractId} = \text{StrKey::encodeContract}(\text{SHA256}(\text{Preimage}))$$
+
+This allows dApps to:
+1. Receive incoming payments to the `C...` address immediately.
+2. Deploy the smart contract lazily on the first outgoing transaction or gasless relay call.
+
+### 3.3 Nonce Management & Replay Protection
+
+Smart account contract execution uses an on-chain monotonic `nonce` stored in the contract's persistent storage, separate from Stellar account sequence numbers:
+- Reading current nonce: `client.getNonce()`
+- When executing transactions with session keys, the nonce must match `expected_nonce` in `execute(to, function, args, expected_nonce, ...)`.
+- The Ancore SDK and Relayer handle nonce synchronization and automatic retry on nonce drift (`NONCE_DRIFT_RETRY_GUIDANCE`).
+
+### 3.4 Soroban Storage TTL Management
+
+Soroban contract state entries have a time-to-live (TTL) measured in ledgers. Active session keys and account data entries must have their TTL refreshed periodically:
+- `refresh_session_key_ttl(public_key)`: Extends the Soroban persistent storage TTL without altering the logical expiry timestamp (`expires_at`).
+- If an account state entry expires, the wallet or relayer issues a `RestoreFootprintOp` before invoking the contract.
+
+---
+
+## 4. Error Hierarchy & Codes
+
+When a request fails, the response envelope contains `ok: false` and a descriptive `error` message or canonical error code.
+
+```
+WalletApiError
+├── WalletNotInstalledError     (Extension not found or timeout > 500ms)
+├── UserRejectedError           (User rejected approval window)
+├── UnauthorizedError           (Origin not in allowlist)
+├── InvalidParamsError          (Zod schema validation failed)
+├── UnsupportedMethodError      (Method not in content-script whitelist)
+├── AccountLockedError          (Wallet is locked)
+├── SimulationFailedError       (Soroban transaction simulation returned error)
+└── NonceMismatchError          (Contract nonce drift detected)
+```
+
+### Error Code Reference
+
+| Code | HTTP / RPC Status | Description | Recommended Recovery |
+|---|---|---|---|
+| `WALLET_NOT_INSTALLED` | — | Content script not injected or extension unresponsive | Prompt user to install Ancore extension |
+| `USER_REJECTED` | `4001` | User dismissed approval modal or clicked "Reject" | Notify user and allow retry |
+| `UNAUTHORIZED` | `4100` | Origin not permitted to call privileged method | Call `requestAccess()` first |
+| `INVALID_PARAMS` | `-32602` | Request payload failed schema validation | Verify parameters match TypeScript interfaces |
+| `UNSUPPORTED_METHOD` | `-32601` | Method name unrecognized by content script bridge | Check method spelling against `ExternalApiMethod` |
+| `LOCKED` | `4900` | Wallet is locked; user must enter password | Open extension unlock prompt |
+| `SIMULATION_FAILED` | `-32000` | Soroban RPC transaction simulation reverted | Check contract preconditions and account balance |
+| `NONCE_MISMATCH` | `-32001` | Contract nonce changed between simulation and submit | Re-fetch `getNonce()` and rebuild transaction |
+
+---
+
+## 5. Migration from `@stellar/freighter-api`
+
+`@ancore/wallet-api` maintains drop-in compatibility for standard Stellar operations while extending support for Soroban Smart Accounts.
+
+### Comparison Table
+
+| Feature | `@stellar/freighter-api` | `@ancore/wallet-api` |
+|---|---|---|
+| Connect | `requestAccess()` → `string` (G-address) | `requestAccess()` → `{ smartAccountId, ownerPublicKey, network }` |
+| Address | `getAddress()` → `{ address: 'G...' }` | `getAddress()` → `{ smartAccountId: 'C...', ownerPublicKey: 'G...' }` |
+| Sign Transaction | `signTransaction(xdr, opts)` | `signTransaction({ xdr, networkPassphrase, submitViaRelayer })` |
+| Sign Auth Entry | `signAuthEntry(entryXdr)` | `signAuthEntry({ authEntryXdr, networkPassphrase })` |
+| Session Keys | ❌ Unsupported | ✅ `requestSessionKey(policy)` |
+| Gasless Meta-Tx | ❌ Unsupported | ✅ `signRelayPayload(params)` |
+| Deployment Status | ❌ N/A | ✅ `getSmartAccount()` (`deployed`, `not_deployed`) |
+
+### Example: Migrating a dApp Connection
+
+```typescript
+// ── Before (Freighter): ──────────────────────────────────────────────────────
+import { getAddress, isConnected, requestAccess } from '@stellar/freighter-api';
+
+if (!(await isConnected())) {
+  await requestAccess();
+}
+const { address } = await getAddress(); // G...
+
+// ── After (Ancore): ──────────────────────────────────────────────────────────
+import { getAddress, isConnected, requestAccess } from '@ancore/wallet-api';
+
+if (!(await isConnected())) {
+  const { smartAccountId, ownerPublicKey } = await requestAccess();
+  console.log('Contract Account:', smartAccountId); // C...
+} else {
+  const { smartAccountId } = await getAddress();
+  console.log('Contract Account:', smartAccountId); // C...
 }
 ```

@@ -18,6 +18,7 @@ import {
 import { withNetworkRetry, type RetryPolicyOptions } from './retry-policy';
 import type { RetryPresetName } from './retry-presets';
 import { getSessionKeyInactiveReason, isSessionKeyActive } from './session-key-utils';
+import { withRetry, type RetryOptions } from './utils/retry';
 
 export interface RefreshSessionKeyTtlParams {
   /** Ed25519 public key (G…) of the session key whose Soroban TTL should be extended. */
@@ -40,6 +41,8 @@ export interface RefreshSessionKeyTtlOptions extends AccountContractReadOptions 
   simulationTimeoutMs?: number;
   /** Optional retry policy or preset name for the simulation RPC call. */
   retry?: RetryPolicyOptions | RetryPresetName;
+  /** Optional retry policy configuration for network operations. */
+  retryOptions?: RetryOptions;
 }
 
 export interface SessionKeyTtlRefresher {
@@ -208,6 +211,10 @@ async function simulateRefreshSessionKeyTtl(
   const simulation = options.retry
     ? await withNetworkRetry(() => simulateInvocation(operation, options), options.retry)
     : await simulateInvocation(operation, options);
+  const simulation = await withRetry(
+    () => simulateInvocation(operation, options),
+    options.retryOptions
+  );
 
   if (rpc.Api.isSimulationError(simulation)) {
     throw mapSimulationError(
