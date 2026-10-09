@@ -1,4 +1,6 @@
 import { AccountContract, type InvocationArgs } from '@ancore/account-abstraction';
+import type { Network } from '@ancore/types';
+import { StrKey } from '@stellar/stellar-sdk';
 
 import { addSessionKey, type AddSessionKeyParams, type SessionKeyWriter } from './add-session-key';
 import {
@@ -19,13 +21,24 @@ import {
   type RevokeSessionKeyParams,
   type SessionKeyRevoker,
 } from './revoke-session-key';
+import { deriveContractId } from './wallet';
+
+import { withRetry, type RetryOptions } from './utils/retry';
+
+import { withRetry, type RetryOptions } from './utils/retry';
 
 export interface AncoreClientOptions {
   accountContractId: string;
+  /**
+   * Default retry configuration for network and RPC calls.
+   */
+  retryOptions?: RetryOptions;
 }
 
 export class AncoreClient {
+  readonly accountContractId: string;
   private readonly accountContract: SessionKeyWriter & SessionKeyRevoker & SessionKeyTtlRefresher;
+  private readonly retryOptions?: RetryOptions;
 
   constructor(options: AncoreClientOptions) {
     if (!options.accountContractId) {
@@ -34,7 +47,22 @@ export class AncoreClient {
       );
     }
 
+    this.accountContractId = options.accountContractId;
     this.accountContract = new AccountContract(options.accountContractId);
+    this.retryOptions = options.retryOptions;
+  }
+
+  /**
+   * Execute an asynchronous network call with the client's configured retry policy.
+   *
+   * @param fn Function to execute
+   * @param overrideOptions Optional override for this specific invocation
+   */
+  withRetry<T>(fn: () => Promise<T>, overrideOptions?: RetryOptions): Promise<T> {
+    return withRetry(fn, {
+      ...this.retryOptions,
+      ...overrideOptions,
+    });
   }
 
   /**
@@ -67,8 +95,32 @@ export class AncoreClient {
     params: RefreshSessionKeyTtlParams,
     options?: RefreshSessionKeyTtlOptions
   ): InvocationArgs | Promise<RefreshSessionKeyTtlResult> {
-    return options
-      ? refreshSessionKeyTtl(this.accountContract, params, options)
-      : refreshSessionKeyTtl(this.accountContract, params);
+    if (!options) {
+      return refreshSessionKeyTtl(this.accountContract, params);
+    }
+
+    const mergedOptions: RefreshSessionKeyTtlOptions = {
+      ...options,
+      retryOptions: {
+        ...this.retryOptions,
+        ...options.retryOptions,
+      },
+    };
+
+    return refreshSessionKeyTtl(this.accountContract, params, mergedOptions);
   }
+}
+
+/**
+ * Convenience factory to create an initialized AncoreClient instance for a smart account.
+ * Automatically looks up or derives the deterministic contract ID from the owner's public key.
+ *
+ * @param publicKey Owner's Stellar public key (G...) or contract ID (C...)
+ * @param options Optional network and client configuration
+ */
+export function createSmartAccount(
+  publicKey: string,
+  options?: CreateSmartAccountClientOptions
+): AncoreClient {
+  return AncoreClient.createSmartAccount(publicKey, options);
 }

@@ -8,14 +8,15 @@
 | [Integration guide](integration-guide.md) | Build on the Ancore SDK |
 | [SDK wrappers](sdk-wrappers.md) | High-level SDK usage patterns |
 | [Contract methods](contract-methods.md) | Soroban account contract API |
-| [dApp API reference](api-reference.md) | Wallet extension message types, wire formats, and examples |
-| [API reference](api-reference.yaml) | OpenAPI spec for services |
+| [dApp API reference](api-reference.md) | Complete dApp message protocol and response formats |
+| [API reference (OpenAPI)](api-reference.yaml) | OpenAPI spec for services |
 
 ## Architecture
 
 | Document | Purpose |
 |----------|---------|
 | [System overview](architecture/OVERVIEW.md) | High-level architecture |
+| [Transaction flow](architecture/TRANSACTION_FLOW.md) | dApp, extension, vault, session key, relayer, and blockchain flow |
 
 ## Examples
 
@@ -23,6 +24,7 @@
 |----------|---------|
 | [Send payment](examples/send-payment.md) | Payment flow with the SDK |
 | [Session key lifecycle](examples/session-key-lifecycle.md) | Create, use, and revoke session keys |
+| [Batch session keys](examples/batch-session-keys.md) | Batch multiple session key requests with AncoreClient |
 | [Session key execute](examples/session-key-execute.md) | Execute with a session key |
 | [Event decoder usage](examples/event-decoder-usage.md) | Decode contract events |
 
@@ -34,6 +36,7 @@
 | [Features](user-guide/FEATURES.md) | Feature overview |
 | [FAQ](user-guide/FAQ.md) | Frequently asked questions |
 | [Troubleshooting](user-guide/TROUBLESHOOTING.md) | Common issues and fixes |
+| [Error-code troubleshooting](troubleshooting.md) | Recovery steps for common wallet and transaction errors |
 
 ## Security
 
@@ -71,6 +74,7 @@
 | [AI intents](ai/intents.md) | Draft intent types for the AI agent MVP |
 | [Indexer events](indexer/contract-events.md) | Contract events indexed by the indexer service |
 | [Extension E2E smoke](testing/extension-e2e-smoke.md) | Browser extension smoke test guide |
+| [Common error codes troubleshooting](troubleshooting/error-codes.md) | Common error codes, root causes, and recovery steps |
 | [Extension build troubleshooting](troubleshooting/extension-build.md) | Build failures and fixes |
 | [Privacy policy](PRIVACY_POLICY.md) | Privacy policy draft |
 | [Terms of service](TERMS_OF_SERVICE.md) | Terms of service draft |
